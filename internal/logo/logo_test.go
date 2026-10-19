@@ -39,7 +39,7 @@ func TestSealFitsZone(t *testing.T) {
 	if math.Abs(l.CX-627) > 15 || math.Abs(l.CY-607) > 15 || l.Rad < 400 || l.Rad > 520 {
 		t.Fatalf("placement circle off: c=(%.1f,%.1f) r=%.1f", l.CX, l.CY, l.Rad)
 	}
-	const px, Z = 400, 5.5
+	const px, Z = 400, 3.45
 	img := l.RenderZone(px, Z)
 	// nothing may be drawn outside the 97% circle, and the seal must reach close to it
 	maxR := 0.0

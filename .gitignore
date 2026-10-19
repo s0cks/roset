@@ -1,3 +1,5 @@
 .rumdl_cache/
-*.svg
+/*.svg
+/*.png
+!testdata/*.svg
 roset

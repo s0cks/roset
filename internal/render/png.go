@@ -13,22 +13,23 @@ import (
 
 // Options customises PNG output.
 type Options struct {
-	Logo   *logo.Logo   // composited into the clear centre zone (logo versions only)
+	Logo   *logo.Logo   // composited into the clear centre disc
 	LogoBG *color.NRGBA // backdrop behind the logo; nil = the symbol background
 }
 
 // PNG rasterizes the layout into a size x size image with 3x3 supersampling.
+// An ink coverage t blends the background towards the ink colour.
 func PNG(l *layout.Layout, size int, fg, bg color.NRGBA, opt *Options) *image.NRGBA {
 	img := image.NewNRGBA(image.Rect(0, 0, size, size))
 	const ss = 3
-	scale := float64(size) / (2 * l.V.TotalRadius())
+	scale := float64(size) / (2 * l.G.Half)
 	half := float64(size) / 2
 
 	var zone *image.NRGBA
 	var zLen int
-	zR := l.V.LogoR
+	zR := l.G.LogoR
 	zbg := bg
-	if opt != nil && opt.Logo != nil && l.V.HasLogo() {
+	if opt != nil && opt.Logo != nil {
 		zLen = (int(2*zR*scale) + 1) * ss
 		zone = opt.Logo.RenderZone(zLen, zR)
 		if opt.LogoBG != nil {
@@ -43,6 +44,13 @@ func PNG(l *layout.Layout, size int, fg, bg color.NRGBA, opt *Options) *image.NR
 		rows <- y
 	}
 	close(rows)
+	mix := func(t float64) [3]float64 {
+		return [3]float64{
+			float64(bg.R) + (float64(fg.R)-float64(bg.R))*t,
+			float64(bg.G) + (float64(fg.G)-float64(bg.G))*t,
+			float64(bg.B) + (float64(fg.B)-float64(bg.B))*t,
+		}
+	}
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
@@ -55,8 +63,7 @@ func PNG(l *layout.Layout, size int, fg, bg color.NRGBA, opt *Options) *image.NR
 							x := (float64(px) + (float64(sx)+0.5)/ss - half) / scale
 							y := (float64(py) + (float64(sy)+0.5)/ss - half) / scale
 							var c [3]float64
-							switch {
-							case zone != nil && x*x+y*y <= zR*zR:
+							if zone != nil && x*x+y*y <= zR*zR {
 								ix := min(zLen-1, max(0, int((x+zR)/(2*zR)*float64(zLen))))
 								iy := min(zLen-1, max(0, int((y+zR)/(2*zR)*float64(zLen))))
 								i := zone.PixOffset(ix, iy)
@@ -66,10 +73,8 @@ func PNG(l *layout.Layout, size int, fg, bg color.NRGBA, opt *Options) *image.NR
 									float64(zone.Pix[i+1])*a + float64(zbg.G)*(1-a),
 									float64(zone.Pix[i+2])*a + float64(zbg.B)*(1-a),
 								}
-							case l.Dark(x, y):
-								c = [3]float64{float64(fg.R), float64(fg.G), float64(fg.B)}
-							default:
-								c = [3]float64{float64(bg.R), float64(bg.G), float64(bg.B)}
+							} else {
+								c = mix(l.Ink(x, y))
 							}
 							sr, sg, sb = sr+c[0], sg+c[1], sb+c[2]
 						}

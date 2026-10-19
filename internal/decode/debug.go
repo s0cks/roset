@@ -5,14 +5,13 @@ import (
 	"image"
 	"image/color"
 	"image/png"
-	"math"
 	"os"
 	"path/filepath"
 )
 
-// WriteDebug dumps bin.png (thresholded image), overlay.png (every sampled cell
-// centre, red = 1, blue = 0, plus the detected centre/sync) and polar.png (the
-// symbol unwrapped so rings are rows and sync is at the left edge).
+// WriteDebug dumps bin.png (the thresholded image) and overlay.png (the detected
+// border corners and every sampled cell centre: header slots red = 1 / blue = 0,
+// data cells shaded by decoded level).
 func (r *Report) WriteDebug(dir string) error {
 	if !r.haveAtt {
 		return errors.New("no attempt reached the sampling stage; nothing to dump")
@@ -37,41 +36,27 @@ func (r *Report) WriteDebug(dir string) error {
 			ov.SetRGBA(x, y, color.RGBA{v, v, v, 255})
 		}
 	}
-	for _, s := range r.samples {
-		c := color.RGBA{40, 90, 255, 255}
-		if s.Bit {
-			c = color.RGBA{255, 40, 40, 255}
-		}
-		for dy := -1; dy <= 1; dy++ {
-			for dx := -1; dx <= 1; dx++ {
-				ov.SetRGBA(int(math.Round(s.X))+dx, int(math.Round(s.Y))+dy, c)
+	dot := func(x, y float64, c color.RGBA, rad int) {
+		cx, cy := int(x+0.5), int(y+0.5)
+		for dy := -rad; dy <= rad; dy++ {
+			for dx := -rad; dx <= rad; dx++ {
+				if dx*dx+dy*dy <= rad*rad && image.Pt(cx+dx, cy+dy).In(ov.Bounds()) {
+					ov.SetRGBA(cx+dx, cy+dy, c)
+				}
 			}
 		}
 	}
-	green := color.RGBA{0, 200, 0, 255}
-	for k := -6; k <= 6; k++ {
-		ov.SetRGBA(int(r.Cx)+k, int(r.Cy), green)
-		ov.SetRGBA(int(r.Cx), int(r.Cy)+k, green)
-	}
-	for rho := 0.0; rho < r.ver.SyncRadius()+2; rho += 0.1 { // sync direction ray
-		x, y := r.frame.ImgPoint(rho, r.Theta0)
-		ov.SetRGBA(int(math.Round(x)), int(math.Round(y)), green)
-	}
-	if err := savePNG(filepath.Join(dir, "overlay.png"), ov); err != nil {
-		return err
-	}
-	const cols, perUnit = 720, 4
-	rows := int((r.ver.SyncRadius() + 2) * perUnit)
-	p := image.NewGray(image.Rect(0, 0, cols, rows))
-	for row := 0; row < rows; row++ {
-		rho := float64(row) / perUnit
-		for col := 0; col < cols; col++ {
-			phi := r.Theta0 + float64(r.Dir)*2*math.Pi*float64(col)/cols
-			x, y := r.frame.ImgPoint(rho, phi)
-			p.SetGray(col, row, color.Gray{uint8(g.Bilinear(x, y))})
+	for _, s := range r.samples {
+		c := color.RGBA{0, 90, 255, 255}
+		if s.Level > 0 {
+			c = color.RGBA{255, uint8(max(0, 90-s.Level*30)), 0, 255}
 		}
+		dot(s.X, s.Y, c, 1)
 	}
-	return savePNG(filepath.Join(dir, "polar.png"), p)
+	for i, c := range r.corners {
+		dot(c[0], c[1], color.RGBA{0, 200, 0, 255}, 3+i) // growing size shows the corner order
+	}
+	return savePNG(filepath.Join(dir, "overlay.png"), ov)
 }
 
 func savePNG(path string, img image.Image) error {

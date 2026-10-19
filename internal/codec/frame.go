@@ -1,9 +1,11 @@
-// Package codec turns a payload into the bit matrix drawn on the rings and back.
+// Package codec turns a payload into the cell matrix drawn on the hex flower and back.
 //
 // Pipeline (encode): payload -> zero-pad to capacity -> Reed-Solomon ->
-// split into 8-cell groups -> deterministic group shuffle (burst protection) ->
-// XOR whitening -> ring cells. The header lives on its own three rings, is not
-// shuffled or whitened, and is protected by 3x repetition plus a CRC.
+// codeword byte g goes to petal g%6 (so a whole damaged petal costs at most one
+// sixth of the codeword) -> deterministic per-petal byte shuffle (burst
+// protection) -> XOR whitening -> bits packed 1 or 2 per cell -> Gray-coded
+// levels. The header sits on its own ring, is not shuffled or whitened, and is
+// protected by 3x repetition plus a CRC.
 package codec
 
 import (
@@ -24,9 +26,11 @@ var ErrHeader = errors.New("codec: header unreadable (CRC failed)")
 
 type Header struct{ Version, Mode, Length int }
 
+// Cells is the symbol content: the header copies and one level per data cell,
+// in the order of spec.Geometry.Cells. Levels are 0 (background) .. Levels()-1 (full ink).
 type Cells struct {
-	Header [spec.HeaderRings][]bool
-	Data   [][]bool
+	Header [spec.HeaderCopies][]bool
+	Data   []uint8
 }
 
 type Result struct {
@@ -55,41 +59,41 @@ func wordHeader(w uint32) (Header, bool) {
 	return h, uint16(w&0xFFFF) == CRC16(headerBytes(h))
 }
 
-func packHeader(h Header) [spec.HeaderRings][]bool {
+func packHeader(h Header) [spec.HeaderCopies][]bool {
 	w := headerWord(h)
-	var out [spec.HeaderRings][]bool
+	var out [spec.HeaderCopies][]bool
 	for j := range out {
-		out[j] = make([]bool, spec.HeaderSlots)
-		for b := 0; b < 32; b++ {
-			out[j][(b+spec.HeaderRotStep*j)%32] = w>>(31-b)&1 == 1
+		out[j] = make([]bool, spec.HeaderBits)
+		for b := 0; b < spec.HeaderBits; b++ {
+			out[j][b] = w>>(31-b)&1 == 1
 		}
 	}
 	return out
 }
 
-// ParseHeader majority-votes the three header copies and verifies the CRC.
-func ParseHeader(rings [spec.HeaderRings][]bool) (Header, error) {
-	var words [spec.HeaderRings]uint32
-	var votes [32]int
-	for j := 0; j < spec.HeaderRings; j++ {
-		if len(rings[j]) != spec.HeaderSlots {
+// ParseHeader majority-votes the header copies and verifies the CRC; each copy is
+// also tried on its own, so one clean copy is always enough.
+func ParseHeader(copies [spec.HeaderCopies][]bool) (Header, error) {
+	var words [spec.HeaderCopies]uint32
+	var votes [spec.HeaderBits]int
+	for j := 0; j < spec.HeaderCopies; j++ {
+		if len(copies[j]) != spec.HeaderBits {
 			return Header{}, ErrHeader
 		}
-		for s := 0; s < 32; s++ {
-			b := ((s-spec.HeaderRotStep*j)%32 + 32) % 32
-			if rings[j][s] {
+		for b := 0; b < spec.HeaderBits; b++ {
+			if copies[j][b] {
 				words[j] |= 1 << (31 - b)
 				votes[b]++
 			}
 		}
 	}
 	var maj uint32
-	for b := 0; b < 32; b++ {
-		if votes[b] >= 2 {
+	for b := 0; b < spec.HeaderBits; b++ {
+		if votes[b]*2 > spec.HeaderCopies {
 			maj |= 1 << (31 - b)
 		}
 	}
-	for _, w := range []uint32{maj, words[0], words[1], words[2]} {
+	for _, w := range append([]uint32{maj}, words[:]...) {
 		if h, ok := wordHeader(w); ok {
 			return h, nil
 		}
@@ -97,10 +101,11 @@ func ParseHeader(rings [spec.HeaderRings][]bool) (Header, error) {
 	return Header{}, ErrHeader
 }
 
+// plan is the version's deterministic permutation and whitening.
 type plan struct {
-	perm   []int  // codeword group g -> cell-group position
-	whiten []bool // per flat cell
-	groups int
+	perm   [][]int // perm[petal][byte index in petal] -> byte slot in the petal
+	whiten []byte  // one bit per codeword-bit position, per flat cell*bits
+	filler []uint8 // levels for cells not covered by any byte slot
 }
 
 var (
@@ -112,23 +117,31 @@ func getPlan(v spec.Version) *plan {
 	if p, ok := plans.Load(v.ID); ok {
 		return p.(*plan)
 	}
-	cells := v.TotalCells()
-	groups := cells / 8
-	perm := make([]int, groups)
-	for i := range perm {
-		perm[i] = i
-	}
+	bpp := v.BytesPerPetal()
+	perm := make([][]int, spec.NumPetals)
 	r := &xorshift32{0xC0DEC0DE}
-	for i := groups - 1; i > 0; i-- {
-		j := int(r.next() % uint32(i+1))
-		perm[i], perm[j] = perm[j], perm[i]
+	for p := range perm {
+		perm[p] = make([]int, bpp)
+		for i := range perm[p] {
+			perm[p][i] = i
+		}
+		for i := bpp - 1; i > 0; i-- {
+			j := int(r.next() % uint32(i+1))
+			perm[p][i], perm[p][j] = perm[p][j], perm[p][i]
+		}
 	}
+	cells := v.TotalCells()
 	w := &xorshift32{0x9E3779B9}
-	wh := make([]bool, cells)
+	wh := make([]byte, cells*v.Bits)
 	for i := range wh {
-		wh[i] = w.next()>>16&1 == 1
+		wh[i] = byte(w.next() >> 16 & 1)
 	}
-	p := &plan{perm: perm, whiten: wh, groups: groups}
+	f := &xorshift32{0x1B873593}
+	fill := make([]uint8, cells)
+	for i := range fill {
+		fill[i] = uint8(f.next()>>16) & uint8(v.Levels()-1)
+	}
+	p := &plan{perm: perm, whiten: wh, filler: fill}
 	plans.Store(v.ID, p)
 	return p
 }
@@ -142,15 +155,32 @@ func getRS(nsym int) *RS {
 	return r
 }
 
-// PickVersion returns the smallest version with the given logo-zone radius
-// (0 = none) whose capacity fits n payload bytes.
-func PickVersion(n int, logoR float64) (spec.Version, error) {
+// gray maps between a bit group and a level so that neighbouring levels differ in one bit.
+func gray(x int) int { return x ^ (x >> 1) }
+
+// byteCells returns the flat index of the first cell of codeword byte g.
+func byteCells(v spec.Version, p *plan, g int) int {
+	petal, idx := g%spec.NumPetals, g/spec.NumPetals
+	return petal*v.Geo().PetalN + p.perm[petal][idx]*v.CellsPerByte()
+}
+
+// PickVersion returns the smallest version with patch radius k and the given
+// bits per cell whose capacity fits n payload bytes.
+func PickVersion(n, k, bits int) (spec.Version, error) {
+	any := false
 	for _, v := range spec.Versions {
-		if v.LogoR == logoR && n <= v.Capacity() && n <= 255 {
+		if v.K != k || v.Bits != bits {
+			continue
+		}
+		any = true
+		if n <= v.Capacity() && n <= 255 {
 			return v, nil
 		}
 	}
-	return spec.Version{}, fmt.Errorf("payload of %d bytes exceeds the largest symbol (%d bytes)", n, spec.Versions[len(spec.Versions)-1].Capacity())
+	if !any {
+		return spec.Version{}, fmt.Errorf("no symbol with patch radius %d and %d levels per cell; try a larger --logo-size or --levels 4", k, 1<<bits)
+	}
+	return spec.Version{}, fmt.Errorf("payload of %d bytes does not fit this logo size / level count; try a larger --logo-size or --levels 4", n)
 }
 
 // Encode builds the cell matrix for a payload.
@@ -165,60 +195,48 @@ func Encode(v spec.Version, mode int, payload []byte) (*Cells, error) {
 	copy(msg, payload)
 	cw := getRS(v.NSym).Encode(msg)
 	p := getPlan(v)
-	flat := make([]bool, v.TotalCells())
-	for g := 0; g < p.groups; g++ {
-		var by byte
-		if g < v.N {
-			by = cw[g]
-		}
-		base := 8 * p.perm[g]
-		for b := 0; b < 8; b++ {
-			flat[base+b] = by>>(7-b)&1 == 1
-		}
-	}
-	for i := range flat {
-		flat[i] = flat[i] != p.whiten[i]
-	}
 	c := &Cells{Header: packHeader(Header{Version: v.ID, Mode: mode, Length: len(payload)})}
-	off := 0
-	for _, n := range v.SlotCounts() {
-		c.Data = append(c.Data, flat[off:off+n:off+n])
-		off += n
+	c.Data = append([]uint8(nil), p.filler...)
+	cpb := v.CellsPerByte()
+	for g := 0; g < v.N; g++ {
+		base := byteCells(v, p, g)
+		for ci := 0; ci < cpb; ci++ {
+			x := 0
+			for b := 0; b < v.Bits; b++ {
+				bitPos := ci*v.Bits + b
+				bit := int(cw[g]>>(7-bitPos)) & 1
+				bit ^= int(p.whiten[(base+ci)*v.Bits+b])
+				x = x<<1 | bit
+			}
+			c.Data[base+ci] = uint8(gray(x))
+		}
 	}
 	return c, nil
 }
 
-// DecodeData recovers the payload from data-ring cells given a parsed header.
-func DecodeData(v spec.Version, h Header, data [][]bool) (*Result, error) {
+// DecodeData recovers the payload from cell levels given a parsed header.
+func DecodeData(v spec.Version, h Header, data []uint8) (*Result, error) {
 	if h.Version != v.ID {
 		return nil, fmt.Errorf("header version %d does not match geometry version %d", h.Version, v.ID)
 	}
 	if h.Length > v.Capacity() {
 		return nil, fmt.Errorf("header length %d exceeds capacity", h.Length)
 	}
-	counts := v.SlotCounts()
-	if len(data) != len(counts) {
-		return nil, errors.New("codec: wrong number of data rings")
-	}
-	flat := make([]bool, 0, v.TotalCells())
-	for k, ring := range data {
-		if len(ring) != counts[k] {
-			return nil, errors.New("codec: wrong slot count on ring")
-		}
-		flat = append(flat, ring...)
+	if len(data) != v.TotalCells() {
+		return nil, errors.New("codec: wrong number of data cells")
 	}
 	p := getPlan(v)
-	for i := range flat {
-		flat[i] = flat[i] != p.whiten[i]
-	}
+	cpb := v.CellsPerByte()
 	cw := make([]byte, v.N)
-	for g := 0; g < v.N; g++ {
-		base := 8 * p.perm[g]
+	for g := range cw {
+		base := byteCells(v, p, g)
 		var by byte
-		for b := 0; b < 8; b++ {
-			by <<= 1
-			if flat[base+b] {
-				by |= 1
+		for ci := 0; ci < cpb; ci++ {
+			x := gray(int(data[base+ci]) & (v.Levels() - 1))
+			for b := 0; b < v.Bits; b++ {
+				bit := x >> (v.Bits - 1 - b) & 1
+				bit ^= int(p.whiten[(base+ci)*v.Bits+b])
+				by = by<<1 | byte(bit)
 			}
 		}
 		cw[g] = by

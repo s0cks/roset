@@ -1,7 +1,6 @@
 package render
 
 import (
-	"crypto/sha256"
 	"math"
 	"math/rand"
 	"regexp"
@@ -9,127 +8,96 @@ import (
 	"strings"
 	"testing"
 
-	"roset/internal/codec"
 	"roset/internal/layout"
 	"roset/internal/spec"
 )
 
-// Independent check that the SVG describes the same picture as layout.Dark
-// (which the PNG rasterizer uses): parse the SVG primitives and compare
-// coverage at random points. Only points within a hair of an edge may differ.
-type prim struct {
-	kind           string // "disc", "ring", "arc"
-	cx, cy, r, sw  float64
-	x0, y0, x1, y1 float64 // arc endpoints
-	rc             float64
-	large          bool
-}
+type circ struct{ x, y, r float64 }
+type seg struct{ x0, y0, x1, y1 float64 }
 
 var (
-	circleRe = regexp.MustCompile(`<circle ([^>]*)/>`)
-	attrRe   = regexp.MustCompile(`([\w-]+)="([^"]*)"`)
-	pathRe   = regexp.MustCompile(`<path d="([^"]*)"[^>]*stroke-width="([^"]*)"`)
-	arcRe    = regexp.MustCompile(`M([-\d.]+) ([-\d.]+)A([-\d.]+) [-\d.]+ 0 (\d) 1 ([-\d.]+) ([-\d.]+)`)
+	reCircle = regexp.MustCompile(`<circle cx="([-\d.]+)" cy="([-\d.]+)" r="([-\d.]+)"/>`)
+	reSeg    = regexp.MustCompile(`M([-\d.]+) ([-\d.]+)L([-\d.]+) ([-\d.]+)`)
 )
 
 func f(s string) float64 { v, _ := strconv.ParseFloat(s, 64); return v }
 
-func parse(svg string) []prim {
-	var out []prim
-	// dots inside <g fill=...> inherit fill, so treat any circle with fill != none as disc
-	for _, m := range circleRe.FindAllStringSubmatch(svg, -1) {
-		a := map[string]string{}
-		for _, kv := range attrRe.FindAllStringSubmatch(m[1], -1) {
-			a[kv[1]] = kv[2]
-		}
-		p := prim{cx: f(a["cx"]), cy: f(a["cy"]), r: f(a["r"])}
-		if a["fill"] == "none" {
-			p.kind, p.sw = "ring", f(a["stroke-width"])
-		} else {
-			p.kind = "disc"
-		}
-		out = append(out, p)
-	}
-	for _, m := range pathRe.FindAllStringSubmatch(svg, -1) {
-		sw := f(m[2])
-		for _, a := range arcRe.FindAllStringSubmatch(m[1], -1) {
-			out = append(out, prim{kind: "arc", x0: f(a[1]), y0: f(a[2]), rc: f(a[3]), large: a[4] == "1", x1: f(a[5]), y1: f(a[6]), sw: sw})
-		}
-	}
-	return out
-}
-
-func ang(x, y float64) float64 { // clockwise from up, [0,2pi)
-	a := math.Atan2(x, -y)
-	if a < 0 {
-		a += 2 * math.Pi
-	}
-	return a
-}
-
-func (p prim) hit(x, y float64) bool {
-	switch p.kind {
-	case "disc":
-		return math.Hypot(x-p.cx, y-p.cy) <= p.r
-	case "ring":
-		return math.Abs(math.Hypot(x-p.cx, y-p.cy)-p.r) <= p.sw/2
-	}
-	r := math.Hypot(x, y)
-	a0, a1 := ang(p.x0, p.y0), ang(p.x1, p.y1)
-	span := math.Mod(a1-a0+2*math.Pi, 2*math.Pi) // clockwise sweep
-	if (span > math.Pi) != p.large {
-		return false // would be the other arc; flag mismatch shows up as coverage diff
-	}
-	if math.Mod(ang(x, y)-a0+2*math.Pi, 2*math.Pi) <= span {
-		return math.Abs(r-p.rc) <= p.sw/2
-	}
-	return math.Hypot(x-p.x0, y-p.y0) <= p.sw/2 || math.Hypot(x-p.x1, y-p.y1) <= p.sw/2
-}
-
+// The SVG's circles and strokes must cover exactly the points the layout model calls inked
+// (outside the solid hexagons, which are polygons).
 func TestSVGMatchesLayout(t *testing.T) {
-	for _, ver := range spec.Versions {
+	for _, id := range []int{1, 6, 9} {
 		for _, st := range []layout.Style{layout.StyleDots, layout.StyleRuns} {
-			h := sha256.Sum256([]byte{byte(ver.ID), byte(st)})
-			payload := append([]byte(nil), h[:]...)
-			mode := codec.ModeRawSHA256
-			if ver.ID == 2 {
-				payload, mode = append(payload, []byte("a tag that needs the bigger symbol....")...), codec.ModeSHA256Tag
+			l := sample(t, id, st)
+			svg := SVG(l, "#16161c", "#faf8f0", nil)
+			var cs []circ
+			var ss []seg
+			for _, m := range reCircle.FindAllStringSubmatch(svg, -1) {
+				cs = append(cs, circ{f(m[1]), f(m[2]), f(m[3])})
 			}
-			c, err := codec.Encode(ver, mode, payload)
-			if err != nil {
-				t.Fatal(err)
+			for _, m := range reSeg.FindAllStringSubmatch(svg, -1) {
+				ss = append(ss, seg{f(m[1]), f(m[2]), f(m[3]), f(m[4])})
 			}
-			l := layout.New(ver, c, st)
-			prims := parse(SVG(l, "#000", "#fff", nil))
-			if len(prims) < 50 {
-				t.Fatalf("parsed only %d primitives", len(prims))
+			if len(cs) == 0 {
+				t.Fatalf("v%d: no circles in SVG", id)
 			}
-			rng := rand.New(rand.NewSource(7))
-			R := ver.OuterRadius()
-			const N = 300000
-			diff, ink := 0, 0
-			for i := 0; i < N; i++ {
-				x, y := (rng.Float64()*2-1)*R, (rng.Float64()*2-1)*R
-				want := l.Dark(x, y)
-				got := false
-				for _, p := range prims {
-					if p.hit(x, y) {
-						got = true
-						break
+			if st == layout.StyleRuns && len(ss) == 0 {
+				t.Fatalf("v%d: runs style produced no strokes", id)
+			}
+			if st == layout.StyleDots && len(ss) != 0 {
+				t.Fatalf("v%d: dots style produced strokes", id)
+			}
+			covered := func(x, y float64) bool {
+				for _, c := range cs {
+					if (x-c.x)*(x-c.x)+(y-c.y)*(y-c.y) <= c.r*c.r {
+						return true
 					}
 				}
-				if want {
-					ink++
+				r := spec.DotRadius
+				for _, s := range ss {
+					dx, dy := s.x1-s.x0, s.y1-s.y0
+					tt := math.Max(0, math.Min(1, ((x-s.x0)*dx+(y-s.y0)*dy)/(dx*dx+dy*dy)))
+					ex, ey := x-(s.x0+tt*dx), y-(s.y0+tt*dy)
+					if ex*ex+ey*ey <= r*r {
+						return true
+					}
 				}
-				if got != want {
-					diff++
+				return false
+			}
+			rng := rand.New(rand.NewSource(int64(id)))
+			g := l.G
+			bad, inked := 0, 0
+			for i := 0; i < 60000; i++ {
+				x, y := (rng.Float64()*2-1)*g.Half, (rng.Float64()*2-1)*g.Half
+				h := spec.HexNorm(x, y)
+				// skip the solid polygons and the boundaries of the dot regions
+				if h < g.AInner+spec.InnerStroke/2+0.05 || h > g.ABorder-spec.BorderStroke/2-0.05 {
+					continue
+				}
+				want := l.Ink(x, y) > 0
+				if want {
+					inked++
+				}
+				if covered(x, y) != want {
+					bad++
 				}
 			}
-			t.Logf("v%d style=%d: %d prims, ink samples %d, disagreements %d", ver.ID, st, len(prims), ink, diff)
-			if float64(diff) > 0.0005*float64(N) {
-				t.Errorf("v%d style=%d: SVG disagrees with layout at %d/%d points", ver.ID, st, diff, N)
+			if inked < 1000 {
+				t.Fatalf("v%d: only %d inked sample points; test is not exercising anything", id, inked)
+			}
+			// SVG coordinates are printed to 3 decimals, so a handful of edge samples may flip
+			if bad > inked/300 {
+				t.Errorf("v%d style=%d: %d of %d inked sample points disagree between SVG and layout", id, st, bad, inked)
 			}
 		}
 	}
-	_ = strings.TrimSpace
+}
+
+func TestSVGLevelColours(t *testing.T) {
+	l := sample(t, 6, layout.StyleDots)
+	svg := SVG(l, "#000000", "#ffffff", nil)
+	for _, want := range []string{`fill="#555555"`, `fill="#aaaaaa"`, `fill="#000000"`} {
+		if !strings.Contains(svg, want) {
+			t.Errorf("4-level SVG lacks a group with %s", want)
+		}
+	}
 }

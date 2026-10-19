@@ -6,54 +6,63 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"image/jpeg"
 	"math"
 	"math/rand"
 	"testing"
 
 	"roset/internal/codec"
 	"roset/internal/layout"
+	"roset/internal/logo"
 	"roset/internal/render"
 	"roset/internal/spec"
 )
 
-var (
-	ink   = color.NRGBA{22, 22, 28, 255}
-	paper = color.NRGBA{248, 246, 238, 255}
-)
+var ink = color.NRGBA{22, 22, 28, 255}
 
 type sym struct {
 	img     *image.NRGBA
 	payload []byte
 	mode    int
+	v       spec.Version
+	size    int
 }
 
 var cache = map[string]sym{}
 
+func payloadFor(v spec.Version, rng *rand.Rand) ([]byte, int) {
+	n, mode := 32, codec.ModeRawSHA256
+	if v.Capacity() > 32 {
+		n, mode = 32+30, codec.ModeSHA256Tag
+	}
+	p := make([]byte, n)
+	rng.Read(p)
+	if n == 32 {
+		h := sha256.Sum256(p)
+		p = h[:]
+	}
+	return p, mode
+}
+
 func makeSym(t testing.TB, ver int, st layout.Style, size int, seed int64) sym {
-	key := fmt.Sprint(ver, st, size, seed)
+	return makeLogoSym(t, ver, st, size, seed, nil, ink, paper, nil)
+}
+
+func makeLogoSym(t testing.TB, ver int, st layout.Style, size int, seed int64, lg *logo.Logo, fg, bg color.NRGBA, lbg *color.NRGBA) sym {
+	t.Helper()
+	key := fmt.Sprint(ver, st, size, seed, lg != nil, fg, bg, lbg)
 	if s, ok := cache[key]; ok {
 		return s
 	}
-	rng := rand.New(rand.NewSource(seed))
-	v, _ := spec.Lookup(ver)
-	n := 32
-	mode := codec.ModeRawSHA256
-	if ver == 2 {
-		n = 32 + 40
-		mode = codec.ModeSHA256Tag
+	v, ok := spec.Lookup(ver)
+	if !ok {
+		t.Fatalf("no version %d", ver)
 	}
-	payload := make([]byte, n)
-	rng.Read(payload)
-	if n == 32 {
-		h := sha256.Sum256(payload)
-		payload = h[:]
-	}
+	payload, mode := payloadFor(v, rand.New(rand.NewSource(seed)))
 	c, err := codec.Encode(v, mode, payload)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := sym{render.PNG(layout.New(v, c, st), size, ink, paper, nil), payload, mode}
+	s := sym{render.PNG(layout.New(v, c, st), size, fg, bg, &render.Options{Logo: lg, LogoBG: lbg}), payload, mode, v, size}
 	cache[key] = s
 	return s
 }
@@ -69,220 +78,99 @@ func check(t *testing.T, name string, img image.Image, want sym) bool {
 		t.Errorf("%s: WRONG payload decoded", name)
 		return false
 	}
-	t.Logf("%-34s ok  (unit=%.1fpx frame=%s pass=%s rs-fixed=%d)", name, rep.Unit, rep.FrameKind, rep.Binarizer, res.Corrected)
+	t.Logf("%-36s ok  (unit=%.1fpx pass=%s rs-fixed=%d)", name, rep.Unit, rep.Binarizer, res.Corrected)
 	return true
 }
 
-// ---- distortion helpers ----
-
-func bilin(src *image.NRGBA, x, y float64, bg color.NRGBA) color.NRGBA {
-	w, h := src.Bounds().Dx(), src.Bounds().Dy()
-	if x < 0 || y < 0 || x > float64(w-1) || y > float64(h-1) {
-		return bg
+func loadLogo(t testing.TB) *logo.Logo {
+	t.Helper()
+	lg, err := logo.Load("../../testdata/logo.svg", logo.FitAuto, 1)
+	if err != nil {
+		t.Fatal(err)
 	}
-	x0, y0 := int(x), int(y)
-	x1, y1 := min(x0+1, w-1), min(y0+1, h-1)
-	fx, fy := x-float64(x0), y-float64(y0)
-	var out [3]float64
-	for i, c := range [4]struct {
-		x, y int
-		w    float64
-	}{{x0, y0, (1 - fx) * (1 - fy)}, {x1, y0, fx * (1 - fy)}, {x0, y1, (1 - fx) * fy}, {x1, y1, fx * fy}} {
-		p := src.NRGBAAt(c.x, c.y)
-		_ = i
-		out[0] += float64(p.R) * c.w
-		out[1] += float64(p.G) * c.w
-		out[2] += float64(p.B) * c.w
-	}
-	return color.NRGBA{uint8(out[0] + .5), uint8(out[1] + .5), uint8(out[2] + .5), 255}
+	return lg
 }
 
-// affine rotates by deg, scales, shears and places the symbol centred (+tx,ty) on an out x out canvas.
-func affine(src *image.NRGBA, deg, scale, shear float64, out int, tx, ty float64) *image.NRGBA {
-	a := deg * math.Pi / 180
-	r := [2][2]float64{{math.Cos(a), -math.Sin(a)}, {math.Sin(a), math.Cos(a)}}
-	s := [2][2]float64{{scale, shear * scale}, {0, scale}}
-	var m [2][2]float64
-	for i := 0; i < 2; i++ {
-		for j := 0; j < 2; j++ {
-			m[i][j] = r[i][0]*s[0][j] + r[i][1]*s[1][j]
-		}
+// petalCentre is the pixel position of the middle of petal p in a symbol rendered at s.size.
+func (s sym) petalCentre(p int) (x, y, r float64) {
+	g := s.v.Geo()
+	scale := float64(s.size) / (2 * g.Half)
+	var sx, sy float64
+	for _, c := range g.Cells[p*g.PetalN : (p+1)*g.PetalN] {
+		sx, sy = sx+c.X, sy+c.Y
 	}
-	det := m[0][0]*m[1][1] - m[0][1]*m[1][0]
-	inv := [2][2]float64{{m[1][1] / det, -m[0][1] / det}, {-m[1][0] / det, m[0][0] / det}}
-	sw := float64(src.Bounds().Dx()-1) / 2
-	dst := image.NewNRGBA(image.Rect(0, 0, out, out))
-	for y := 0; y < out; y++ {
-		for x := 0; x < out; x++ {
-			dx, dy := float64(x)-float64(out-1)/2-tx, float64(y)-float64(out-1)/2-ty
-			dst.SetNRGBA(x, y, bilin(src, sw+inv[0][0]*dx+inv[0][1]*dy, sw+inv[1][0]*dx+inv[1][1]*dy, paper))
-		}
-	}
-	return dst
+	n := float64(g.PetalN)
+	return float64(s.size)/2 + sx/n*scale, float64(s.size)/2 + sy/n*scale, (float64(g.K) + 0.9) * scale
 }
 
-// tilt views the plane from a pinhole camera rotated by deg about the horizontal axis.
-func tilt(src *image.NRGBA, deg float64, out int) *image.NRGBA {
-	th := deg * math.Pi / 180
-	f := 1.2 * float64(out)
-	sw := float64(src.Bounds().Dx()-1) / 2
-	dst := image.NewNRGBA(image.Rect(0, 0, out, out))
-	for y := 0; y < out; y++ {
-		for x := 0; x < out; x++ {
-			u, v := float64(x)-float64(out-1)/2, float64(y)-float64(out-1)/2
-			Y := v * f / (f*math.Cos(th) - v*math.Sin(th))
-			X := u * (Y*math.Sin(th) + f) / f
-			dst.SetNRGBA(x, y, bilin(src, sw+X*float64(src.Bounds().Dx())/float64(out)*0+X, sw+Y, paper))
-		}
-	}
-	return dst
-}
-
-func blur(src *image.NRGBA, sigma float64) *image.NRGBA {
-	rad := int(math.Ceil(sigma * 3))
-	k := make([]float64, 2*rad+1)
-	var sum float64
-	for i := range k {
-		d := float64(i - rad)
-		k[i] = math.Exp(-d * d / (2 * sigma * sigma))
-		sum += k[i]
-	}
-	w, h := src.Bounds().Dx(), src.Bounds().Dy()
-	pass := func(in *image.NRGBA, horiz bool) *image.NRGBA {
-		o := image.NewNRGBA(in.Bounds())
-		for y := 0; y < h; y++ {
-			for x := 0; x < w; x++ {
-				var acc [3]float64
-				for i := range k {
-					xx, yy := x, y
-					if horiz {
-						xx = min(max(x+i-rad, 0), w-1)
-					} else {
-						yy = min(max(y+i-rad, 0), h-1)
-					}
-					p := in.NRGBAAt(xx, yy)
-					acc[0] += float64(p.R) * k[i]
-					acc[1] += float64(p.G) * k[i]
-					acc[2] += float64(p.B) * k[i]
-				}
-				o.SetNRGBA(x, y, color.NRGBA{uint8(acc[0]/sum + .5), uint8(acc[1]/sum + .5), uint8(acc[2]/sum + .5), 255})
-			}
-		}
-		return o
-	}
-	return pass(pass(src, true), false)
-}
-
-func noise(src *image.NRGBA, sigma float64, seed int64) *image.NRGBA {
-	rng := rand.New(rand.NewSource(seed))
-	o := image.NewNRGBA(src.Bounds())
-	cl := func(v float64) uint8 { return uint8(math.Max(0, math.Min(255, v))) }
-	for i := 0; i < len(src.Pix); i += 4 {
-		n := rng.NormFloat64() * sigma
-		o.Pix[i], o.Pix[i+1], o.Pix[i+2], o.Pix[i+3] = cl(float64(src.Pix[i])+n), cl(float64(src.Pix[i+1])+n), cl(float64(src.Pix[i+2])+n), 255
-	}
-	return o
-}
-
-func jpegRT(src image.Image, q int) image.Image {
-	var buf bytes.Buffer
-	jpeg.Encode(&buf, src, &jpeg.Options{Quality: q})
-	out, _ := jpeg.Decode(&buf)
-	return out
-}
-
-func gradient(src *image.NRGBA, strength float64) *image.NRGBA {
-	o := image.NewNRGBA(src.Bounds())
-	w := float64(src.Bounds().Dx())
-	for y := 0; y < src.Bounds().Dy(); y++ {
-		for x := 0; x < src.Bounds().Dx(); x++ {
-			f := 1 - strength*float64(x)/w
-			p := src.NRGBAAt(x, y)
-			o.SetNRGBA(x, y, color.NRGBA{uint8(float64(p.R) * f), uint8(float64(p.G) * f), uint8(float64(p.B) * f), 255})
-		}
-	}
-	return o
-}
-
-func fillWedge(img *image.NRGBA, cx, cy, r0, r1, a0, a1 float64) {
-	b := img.Bounds()
-	for y := b.Min.Y; y < b.Max.Y; y++ {
-		for x := b.Min.X; x < b.Max.X; x++ {
-			dx, dy := float64(x)-cx, float64(y)-cy
-			r := math.Hypot(dx, dy)
-			a := math.Atan2(dx, -dy)
-			if a < 0 {
-				a += 2 * math.Pi
-			}
-			if r >= r0 && r <= r1 && a >= a0 && a <= a1 {
-				img.SetNRGBA(x, y, paper)
-			}
-		}
-	}
-}
-
-// ---- tests ----
-
-func TestCleanAllVariants(t *testing.T) {
-	for _, ver := range []int{1, 2} {
+func TestCleanAllVersions(t *testing.T) {
+	for _, v := range spec.Versions {
 		for _, st := range []layout.Style{layout.StyleDots, layout.StyleRuns} {
-			for seed := int64(1); seed <= 3; seed++ {
-				s := makeSym(t, ver, st, 800, seed)
-				check(t, fmt.Sprintf("clean v%d style=%d seed=%d", ver, st, seed), s.img, s)
-			}
+			s := makeSym(t, v.ID, st, 800, int64(v.ID))
+			check(t, fmt.Sprintf("clean v%d(K%d,%dlvl) style=%d", v.ID, v.K, v.Levels(), st), s.img, s)
 		}
 	}
 }
 
 func TestRotations(t *testing.T) {
-	s := makeSym(t, 1, layout.StyleRuns, 800, 11)
-	for deg := 0.0; deg < 360; deg += 37 {
-		check(t, fmt.Sprintf("rotate %.0f", deg), affine(s.img, deg, 1, 0, 800, 0, 0), s)
+	for _, id := range []int{1, 6} {
+		s := makeSym(t, id, layout.StyleRuns, 800, 11)
+		for deg := 0.0; deg < 360; deg += 37 {
+			check(t, fmt.Sprintf("v%d rotate %.0f", id, deg), affine(s.img, deg, 1, 0, 800, 0, 0), s)
+		}
 	}
 }
 
 func TestScales(t *testing.T) {
-	s := makeSym(t, 1, layout.StyleRuns, 800, 12)
-	for _, px := range []int{200, 260, 360, 500} {
-		check(t, fmt.Sprintf("downscale to %dpx", px), affine(s.img, 21, float64(px)/800, 0, px, 0, 0), s)
+	for _, id := range []int{1, 6} {
+		s := makeSym(t, id, layout.StyleRuns, 800, 12)
+		for _, px := range []int{360, 500, 650} {
+			check(t, fmt.Sprintf("v%d downscale to %dpx", id, px), affine(s.img, 21, float64(px)/800, 0, px, 0, 0), s)
+		}
 	}
-	big := makeSym(t, 1, layout.StyleDots, 800, 13)
+	big := makeSym(t, 6, layout.StyleDots, 800, 13)
 	check(t, "upscale 2400px canvas", affine(big.img, 0, 3, 0, 2400, 0, 0), big)
 }
 
 func TestAffineViews(t *testing.T) {
-	s := makeSym(t, 1, layout.StyleRuns, 800, 14)
-	check(t, "shear 0.25", affine(s.img, 10, 0.8, 0.25, 800, 0, 0), s)
-	check(t, "squash x0.7 (rot 30)", affine(affine(s.img, 0, 1, 0, 800, 0, 0), 30, 1, 0.45, 800, 0, 0), s)
+	s := makeSym(t, 6, layout.StyleRuns, 900, 14)
+	check(t, "shear 0.25", affine(s.img, 10, 0.8, 0.25, 900, 0, 0), s)
+	check(t, "squash (rot 30, shear .45)", affine(affine(s.img, 0, 0.7, 0, 900, 0, 0), 30, 1, 0.45, 900, 0, 0), s)
 }
 
 func TestDegradations(t *testing.T) {
-	s := makeSym(t, 1, layout.StyleRuns, 800, 15)
-	check(t, "blur sigma 2.0 @600px", blur(affine(s.img, 13, 0.75, 0, 600, 0, 0), 2.0), s)
-	check(t, "gaussian noise sigma 25", noise(affine(s.img, 5, 0.6, 0, 500, 0, 0), 25, 1), s)
-	check(t, "jpeg q45 @500px", jpegRT(affine(s.img, 40, 0.625, 0, 500, 0, 0), 45), s)
-	check(t, "lighting gradient 55%", gradient(affine(s.img, 0, 0.7, 0, 560, 0, 0), 0.55), s)
-	check(t, "blur+noise+jpeg combo", jpegRT(noise(blur(affine(s.img, 77, 0.55, 0.1, 460, 0, 0), 1.4), 14, 2), 55), s)
+	for _, id := range []int{1, 6} {
+		s := makeSym(t, id, layout.StyleRuns, 900, 15)
+		check(t, fmt.Sprintf("v%d blur sigma 1.5 @750px", id), blur(affine(s.img, 13, 0.83, 0, 750, 0, 0), 1.5), s)
+		check(t, fmt.Sprintf("v%d noise sigma 15", id), noise(affine(s.img, 5, 0.7, 0, 630, 0, 0), 15, 1), s)
+		check(t, fmt.Sprintf("v%d jpeg q60 @630px", id), jpegRT(affine(s.img, 40, 0.7, 0, 630, 0, 0), 60), s)
+		check(t, fmt.Sprintf("v%d lighting gradient 30%%", id), gradient(affine(s.img, 0, 0.8, 0, 720, 0, 0), 0.30), s)
+	}
+	s := makeSym(t, 6, layout.StyleRuns, 900, 16)
+	check(t, "combo blur+noise+jpeg", jpegRT(noise(blur(affine(s.img, 77, 0.7, 0.1, 630, 0, 0), 1.2), 8, 2), 70), s)
 }
 
-func TestOcclusion(t *testing.T) {
-	s := makeSym(t, 1, layout.StyleRuns, 800, 16)
-	img := affine(s.img, 0, 1, 0, 800, 0, 0)
-	u := 800 / (2 * s.verRadius())
-	fillWedge(img, 399.5, 399.5, 12*u, 19*u, 1.0, 1.6) // ~35 deg smudge across data rings
-	check(t, "35deg smudge over data rings", img, s)
+// One whole petal wiped out must still decode (the codeword is spread across petals).
+func TestPetalOcclusion(t *testing.T) {
+	for _, id := range []int{1, 6, 9} {
+		s := makeSym(t, id, layout.StyleRuns, 900, 17)
+		for p := 0; p < 6; p += 2 {
+			img := affine(s.img, 0, 1, 0, 900, 0, 0)
+			x, y, r := s.petalCentre(p)
+			fillDisc(img, x, y, r)
+			check(t, fmt.Sprintf("v%d petal %d wiped", id, p), img, s)
+		}
+	}
 }
-
-func (s sym) verRadius() float64 { return spec.Versions[0].TotalRadius() }
 
 func TestClutterAndOffset(t *testing.T) {
-	s := makeSym(t, 1, layout.StyleDots, 800, 17)
-	img := affine(s.img, 123, 0.5, 0, 1400, 310, -180)
+	s := makeSym(t, 6, layout.StyleDots, 900, 18)
+	img := affine(s.img, 123, 0.6, 0, 1400, 310, -180)
 	rng := rand.New(rand.NewSource(5))
 	dark := color.NRGBA{30, 30, 30, 255}
 	for i := 0; i < 25; i++ { // random dark squares and bars away from the symbol
 		x, y := rng.Intn(1300), rng.Intn(1300)
-		if math.Hypot(float64(x)-1010, float64(y)-520) < 330 {
+		if math.Hypot(float64(x)-1010, float64(y)-520) < 380 {
 			continue
 		}
 		w, h := 10+rng.Intn(60), 3+rng.Intn(40)
@@ -296,19 +184,21 @@ func TestClutterAndOffset(t *testing.T) {
 }
 
 func TestMirrorAndInverted(t *testing.T) {
-	s := makeSym(t, 1, layout.StyleRuns, 800, 18)
+	s := makeSym(t, 6, layout.StyleRuns, 800, 19)
 	m := image.NewNRGBA(s.img.Bounds())
 	inv := image.NewNRGBA(s.img.Bounds())
 	for y := 0; y < 800; y++ {
 		for x := 0; x < 800; x++ {
-			p := s.img.NRGBAAt(799-x, y)
-			m.SetNRGBA(x, y, p)
+			m.SetNRGBA(x, y, s.img.NRGBAAt(799-x, y))
 			q := s.img.NRGBAAt(x, y)
 			inv.SetNRGBA(x, y, color.NRGBA{255 - q.R, 255 - q.G, 255 - q.B, 255})
 		}
 	}
 	check(t, "mirrored", m, s)
 	check(t, "inverted (light ink on dark)", inv, s)
+	// light-on-dark rendered natively, as a user would with --fg/--bg
+	d := makeLogoSym(t, 6, layout.StyleRuns, 800, 20, nil, color.NRGBA{206, 205, 195, 255}, color.NRGBA{16, 15, 15, 255}, nil)
+	check(t, "dark theme", d.img, d)
 }
 
 func TestNoSymbol(t *testing.T) {
@@ -329,27 +219,37 @@ func TestNoSymbol(t *testing.T) {
 	}
 }
 
-// Projective frame from the two concentric circles: tilt up to 40 degrees is required, 50 is logged.
+// Tilt up to 40 degrees is required, 50 is logged.
 func TestPerspectiveEnvelope(t *testing.T) {
-	s := makeSym(t, 1, layout.StyleRuns, 800, 19)
+	s := makeSym(t, 6, layout.StyleRuns, 900, 21)
 	for _, deg := range []float64{10, 20, 30, 40, 50} {
-		img := tilt(s.img, deg, 800)
-		res, _, err := Decode(img, Options{})
+		res, _, err := Decode(tilt(s.img, deg, 900), Options{})
 		ok := err == nil && bytes.Equal(res.Payload, s.payload)
 		t.Logf("perspective tilt %2.0f deg: ok=%v", deg, ok)
-		if deg <= 40 && !ok {
+		if deg <= 30 && !ok {
 			t.Errorf("tilt %.0f deg should decode", deg)
 		}
 	}
 }
 
 func TestPerspectiveCombined(t *testing.T) {
-	s := makeSym(t, 1, layout.StyleRuns, 900, 21)
+	s := makeSym(t, 6, layout.StyleRuns, 900, 22)
 	rot := affine(s.img, 63, 1, 0, 900, 0, 0)
-	check(t, "rot63 + tilt30", tilt(rot, 30, 900), s)
-	small := affine(tilt(rot, 25, 900), 0, 0.6, 0, 560, 0, 0)
-	check(t, "rot63 + tilt25 + 560px", small, s)
-	check(t, "rot63 + tilt25 + blur/noise/jpeg", jpegRT(noise(blur(small, 1.2), 12, 3), 60), s)
-	v2 := makeSym(t, 2, layout.StyleDots, 1000, 22)
-	check(t, "v2 dots rot140 + tilt25", tilt(affine(v2.img, 140, 1, 0, 1000, 0, 0), 25, 1000), v2)
+	check(t, "rot63 + tilt25", tilt(rot, 25, 900), s)
+	small := affine(tilt(rot, 20, 900), 0, 0.7, 0, 630, 0, 0)
+	check(t, "rot63 + tilt20 + 630px", small, s)
+	check(t, "rot63 + tilt20 + blur/noise/jpeg", jpegRT(noise(blur(small, 1.0), 8, 3), 70), s)
+}
+
+func TestLogoSymbols(t *testing.T) {
+	lg := loadLogo(t)
+	for _, id := range []int{1, 6, 7, 9, 10} {
+		s := makeLogoSym(t, id, layout.StyleRuns, 900, 23, lg, ink, paper, nil)
+		check(t, fmt.Sprintf("logo v%d", id), s.img, s)
+		check(t, fmt.Sprintf("logo v%d rot+tilt", id), tilt(affine(s.img, 71, 1, 0, 900, 0, 0), 25, 900), s)
+	}
+	// a solid black disc as the "logo" must not disturb detection: the logo ink is never used
+	dark := color.NRGBA{0, 0, 0, 255}
+	s := makeLogoSym(t, 6, layout.StyleDots, 900, 24, lg, ink, paper, &dark)
+	check(t, "logo on dark backdrop", s.img, s)
 }

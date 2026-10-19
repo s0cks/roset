@@ -5,16 +5,24 @@ import (
 	"fmt"
 	"image"
 	"os"
+	"strconv"
 	"testing"
 
 	"roset/internal/layout"
-	"roset/internal/spec"
 )
 
-// RINGSUM_ENVELOPE=1 go test ./internal/decode -run Envelope -v
+// ROSET_ENVELOPE=1 [ROSET_ENVELOPE_VER=6] go test ./internal/decode -run Envelope -v
+//
+// Prints how far each degradation can go before a symbol of that version stops
+// decoding. Compare versions of the same patch radius to see what extra levels
+// per cell cost: 1 vs 6 (K=5, 2 vs 4 levels), 9 is the 80-byte K=5 symbol.
 func TestEnvelope(t *testing.T) {
-	if os.Getenv("RINGSUM_ENVELOPE") == "" {
-		t.Skip("set RINGSUM_ENVELOPE=1 to map the robustness envelope")
+	if os.Getenv("ROSET_ENVELOPE") == "" {
+		t.Skip("set ROSET_ENVELOPE=1 to map the robustness envelope")
+	}
+	ver := 6
+	if v := os.Getenv("ROSET_ENVELOPE_VER"); v != "" {
+		ver, _ = strconv.Atoi(v)
 	}
 	try := func(img image.Image, want sym) string {
 		res, _, err := Decode(img, Options{})
@@ -26,11 +34,8 @@ func TestEnvelope(t *testing.T) {
 		}
 		return "fail"
 	}
-	s := makeSym(t, 1, layout.StyleRuns, 1000, 31)
-	if os.Getenv("RINGSUM_ENVELOPE_LOGO") != "" { // measure a medium-logo symbol (version 5) instead
-		lg := loadLogo(t, "../../testdata/logo.svg")
-		s = makeLogoSym(t, 5, layout.StyleRuns, 1000, 31, lg, ink, paper, nil)
-	}
+	s := makeSym(t, ver, layout.StyleRuns, 1000, 31)
+	fmt.Printf("version %d: K=%d, %d levels, RS(%d,%d)\n", s.v.ID, s.v.K, s.v.Levels(), s.v.N, s.v.Payload)
 	line := func(name string, vals []float64, f func(v float64) image.Image) {
 		out := name + ":"
 		for _, v := range vals {
@@ -38,30 +43,30 @@ func TestEnvelope(t *testing.T) {
 		}
 		fmt.Println(out)
 	}
-	line("image size px          ", []float64{200, 160, 130, 110, 90, 70}, func(v float64) image.Image {
+	line("image size px          ", []float64{300, 240, 200, 170, 140, 120, 100}, func(v float64) image.Image {
 		return affine(s.img, 17, v/1000, 0, int(v), 0, 0)
 	})
-	line("blur sigma @500px      ", []float64{2, 3, 4, 5, 6}, func(v float64) image.Image {
+	line("blur sigma @500px      ", []float64{1, 1.5, 2, 2.5, 3, 4}, func(v float64) image.Image {
 		return blur(affine(s.img, 9, 0.5, 0, 500, 0, 0), v)
 	})
-	line("noise sigma @500px     ", []float64{30, 50, 70, 90}, func(v float64) image.Image {
+	line("noise sigma @500px     ", []float64{10, 20, 30, 45, 60, 90}, func(v float64) image.Image {
 		return noise(affine(s.img, 9, 0.5, 0, 500, 0, 0), v, 4)
 	})
-	line("jpeg quality @420px    ", []float64{40, 25, 15, 8, 4}, func(v float64) image.Image {
-		return jpegRT(affine(s.img, 9, 0.42, 0, 420, 0, 0), int(v))
+	line("jpeg quality @500px    ", []float64{60, 40, 25, 15, 8, 4}, func(v float64) image.Image {
+		return jpegRT(affine(s.img, 9, 0.5, 0, 500, 0, 0), int(v))
 	})
-	line("smudge degrees (data)  ", []float64{30, 60, 80, 100, 130}, func(v float64) image.Image {
+	line("lighting gradient      ", []float64{0.2, 0.35, 0.5, 0.65}, func(v float64) image.Image {
+		return gradient(affine(s.img, 0, 0.5, 0, 500, 0, 0), v)
+	})
+	line("petals wiped (of 6)    ", []float64{1, 2, 3}, func(v float64) image.Image {
 		img := affine(s.img, 0, 1, 0, 1000, 0, 0)
-		u := 1000 / (2 * s.verRadius())
-		r0, r1 := 10.5, 18.6
-		if os.Getenv("RINGSUM_ENVELOPE_LOGO") != "" {
-			u = 1000 / (2 * spec.Versions[4].TotalRadius())
-			r0, r1 = 15, 20.5
+		for p := 0; p < int(v); p++ {
+			x, y, r := s.petalCentre(p)
+			fillDisc(img, x, y, r)
 		}
-		fillWedge(img, 499.5, 499.5, r0*u, r1*u, 0.5, 0.5+v*3.14159/180)
 		return img
 	})
-	line("tilt degrees           ", []float64{40, 50, 60, 65, 70}, func(v float64) image.Image {
+	line("tilt degrees           ", []float64{30, 40, 50, 55, 60, 65}, func(v float64) image.Image {
 		return tilt(s.img, v, 1000)
 	})
 }

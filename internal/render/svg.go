@@ -3,6 +3,7 @@ package render
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 
 	"roset/internal/layout"
@@ -12,89 +13,126 @@ import (
 
 // SVGOptions customises SVG output.
 type SVGOptions struct {
-	Logo   *logo.Logo // embedded (as vector if it is an SVG) in the clear centre zone
+	Logo   *logo.Logo // embedded (as vector if it is an SVG) in the clear centre disc
 	LogoBG string     // CSS colour behind the logo; "" = the symbol background
 }
 
-// SVG renders the layout as a self-contained vector image. fg and bg are CSS colors.
+// mixHex blends two #rrggbb colours: t=0 gives bg, t=1 gives fg.
+func mixHex(fg, bg string, t float64) string {
+	p := func(s string) [3]float64 {
+		var c [3]float64
+		s = strings.TrimPrefix(s, "#")
+		for i := 0; i < 3 && len(s) >= 6; i++ {
+			v, _ := strconv.ParseUint(s[2*i:2*i+2], 16, 8)
+			c[i] = float64(v)
+		}
+		return c
+	}
+	f, b := p(fg), p(bg)
+	var o [3]int
+	for i := range o {
+		o[i] = int(b[i] + (f[i]-b[i])*t + 0.5)
+	}
+	return fmt.Sprintf("#%02x%02x%02x", o[0], o[1], o[2])
+}
+
+func hexPoints(apothem float64) string {
+	r := spec.ApothemToCircumradius(apothem)
+	var pts []string
+	for j := 0; j < 6; j++ {
+		a := float64(j) * math.Pi / 3
+		pts = append(pts, fmt.Sprintf("%.3f,%.3f", r*math.Cos(a), r*math.Sin(a)))
+	}
+	return strings.Join(pts, " ")
+}
+
+// SVG renders the layout as a self-contained vector image. fg and bg are #rrggbb colours.
 func SVG(l *layout.Layout, fg, bg string, opt *SVGOptions) string {
-	v := l.V
-	R := v.TotalRadius()
+	v, g := l.V, l.G
+	R := g.Half
 	var b strings.Builder
 	fmt.Fprintf(&b, `<svg xmlns="http://www.w3.org/2000/svg" viewBox="%.3f %.3f %.3f %.3f" width="1024" height="1024">`+"\n", -R, -R, 2*R, 2*R)
 	fmt.Fprintf(&b, `<title>roset v%d</title>`+"\n", v.ID)
 	fmt.Fprintf(&b, `<rect x="%.3f" y="%.3f" width="%.3f" height="%.3f" fill="%s"/>`+"\n", -R, -R, 2*R, 2*R, bg)
 
-	if opt != nil && opt.Logo != nil && v.HasLogo() {
+	if opt != nil && opt.Logo != nil {
 		zbg := bg
 		if opt.LogoBG != "" {
 			zbg = opt.LogoBG
 		}
-		fmt.Fprintf(&b, `<defs><clipPath id="rs-logo-zone"><circle r="%.3f"/></clipPath></defs>`+"\n", v.LogoR)
-		fmt.Fprintf(&b, `<circle r="%.3f" fill="%s"/>`+"\n", v.LogoR, zbg)
-		fmt.Fprintf(&b, `<g clip-path="url(#rs-logo-zone)">`+"\n%s</g>\n", opt.Logo.SVGFragment(v.LogoR))
+		fmt.Fprintf(&b, `<defs><clipPath id="rs-logo-zone"><circle r="%.3f"/></clipPath></defs>`+"\n", g.LogoR)
+		fmt.Fprintf(&b, `<circle r="%.3f" fill="%s"/>`+"\n", g.LogoR, zbg)
+		fmt.Fprintf(&b, `<g clip-path="url(#rs-logo-zone)">`+"\n%s</g>\n", opt.Logo.SVGFragment(g.LogoR))
 	}
-	// finder bullseye
-	for _, band := range v.FinderBands() {
-		if band[0] == 0 {
-			fmt.Fprintf(&b, `<circle r="%.3f" fill="%s"/>`+"\n", band[1], fg)
-		} else {
-			fmt.Fprintf(&b, `<circle r="%.3f" fill="none" stroke="%s" stroke-width="%.3f"/>`+"\n",
-				(band[0]+band[1])/2, fg, band[1]-band[0])
-		}
-	}
-	// boundary ring and sync dot
-	fmt.Fprintf(&b, `<circle r="%.3f" fill="none" stroke="%s" stroke-width="%.3f"/>`+"\n", v.BoundaryRadius(), fg, 2*spec.BoundaryHalf)
-	fmt.Fprintf(&b, `<circle cx="0" cy="%.3f" r="%.3f" fill="%s"/>`+"\n", -v.SyncRadius(), spec.SyncDotRadius, fg)
+	// inner hexagon and border
+	fmt.Fprintf(&b, `<polygon points="%s" fill="none" stroke="%s" stroke-width="%.3f" stroke-linejoin="miter"/>`+"\n", hexPoints(g.AInner), fg, spec.InnerStroke)
+	fmt.Fprintf(&b, `<polygon points="%s" fill="none" stroke="%s" stroke-width="%.3f" stroke-linejoin="miter"/>`+"\n", hexPoints(g.ABorder), fg, spec.BorderStroke)
 
-	var dots, arcs, fulls strings.Builder
-	ring := func(bits []bool, rc float64) {
-		n := len(bits)
-		at := func(i int) (float64, float64) {
-			a := 2 * math.Pi * float64(i) / float64(n)
-			return rc * math.Sin(a), -rc * math.Cos(a)
-		}
-		if l.Style == layout.StyleDots {
-			for i, on := range bits {
-				if on {
-					x, y := at(i)
-					fmt.Fprintf(&dots, `<circle cx="%.3f" cy="%.3f" r="%.3f"/>`+"\n", x, y, spec.DotRadius)
-				}
+	// header ring: dots, or runs as strokes along the ring
+	n := spec.HeaderSlots
+	var hd, hs strings.Builder
+	if l.Style == layout.StyleDots {
+		for t := 0; t < n; t++ {
+			if l.HeaderBit(t) {
+				x, y := g.HeaderPos(t)
+				fmt.Fprintf(&hd, `<circle cx="%.3f" cy="%.3f" r="%.3f"/>`+"\n", x, y, spec.DotRadius)
 			}
-			return
 		}
-		for _, run := range layout.Runs(bits) {
+	} else {
+		for _, run := range l.HeaderRuns() {
 			switch {
-			case run.Len == n:
-				fmt.Fprintf(&fulls, `<circle r="%.3f" fill="none" stroke="%s" stroke-width="%.3f"/>`+"\n", rc, fg, 2*spec.DotRadius)
-			case run.Len == 1:
-				x, y := at(run.Start)
-				fmt.Fprintf(&dots, `<circle cx="%.3f" cy="%.3f" r="%.3f"/>`+"\n", x, y, spec.DotRadius)
+			case run.B == n:
+				fmt.Fprintf(&hs, `<polygon points="%s" fill="none" stroke="%s" stroke-width="%.3f"/>`+"\n", hexPoints(g.AHeader), fg, 2*spec.DotRadius)
+			case run.B == 1:
+				x, y := g.HeaderPos(run.A)
+				fmt.Fprintf(&hd, `<circle cx="%.3f" cy="%.3f" r="%.3f"/>`+"\n", x, y, spec.DotRadius)
 			default:
-				x0, y0 := at(run.Start)
-				x1, y1 := at((run.Start + run.Len - 1) % n)
-				large := 0
-				if 2*math.Pi*float64(run.Len-1)/float64(n) > math.Pi {
-					large = 1
+				for k := 0; k < run.B-1; k++ {
+					x0, y0 := g.HeaderPos((run.A + k) % n)
+					x1, y1 := g.HeaderPos((run.A + k + 1) % n)
+					fmt.Fprintf(&hs, `<path d="M%.3f %.3fL%.3f %.3f" stroke="%s" stroke-width="%.3f" stroke-linecap="round" fill="none"/>`+"\n", x0, y0, x1, y1, fg, 2*spec.DotRadius)
 				}
-				fmt.Fprintf(&arcs, "M%.3f %.3fA%.3f %.3f 0 %d 1 %.3f %.3f", x0, y0, rc, rc, large, x1, y1)
 			}
 		}
 	}
-	for j := 0; j < spec.HeaderRings; j++ {
-		ring(l.Cells.Header[j], v.HeaderRingRadius(j))
+	if hd.Len() > 0 {
+		fmt.Fprintf(&b, `<g fill="%s">`+"\n%s</g>\n", fg, hd.String())
 	}
-	for k := 0; k < v.Rings; k++ {
-		ring(l.Cells.Data[k], v.DataRingRadius(k))
-	}
-	if dots.Len() > 0 {
-		fmt.Fprintf(&b, `<g fill="%s">`+"\n%s</g>\n", fg, dots.String())
-	}
+	b.WriteString(hs.String())
+
+	// data cells, grouped by level
+	pairs := l.Pairs()
+	linked := map[int]bool{}
 	if l.Style == layout.StyleRuns {
-		if arcs.Len() > 0 {
-			fmt.Fprintf(&b, `<path d="%s" fill="none" stroke="%s" stroke-width="%.3f" stroke-linecap="round"/>`+"\n", arcs.String(), fg, 2*spec.DotRadius)
+		for _, p := range pairs {
+			linked[p.A], linked[p.B] = true, true
 		}
-		b.WriteString(fulls.String())
+	}
+	for lv := 1; lv < v.Levels(); lv++ {
+		col := mixHex(fg, bg, l.Darkness(uint8(lv)))
+		var dots, links strings.Builder
+		for i, c := range g.Cells {
+			if int(l.Cells.Data[i]) == lv && !linked[i] {
+				fmt.Fprintf(&dots, `<circle cx="%.3f" cy="%.3f" r="%.3f"/>`+"\n", c.X, c.Y, spec.DotRadius)
+			}
+		}
+		if l.Style == layout.StyleRuns {
+			var d strings.Builder
+			for _, p := range pairs {
+				if int(l.Cells.Data[p.A]) != lv {
+					continue
+				}
+				a, c := g.Cells[p.A], g.Cells[p.B]
+				fmt.Fprintf(&d, "M%.3f %.3fL%.3f %.3f", a.X, a.Y, c.X, c.Y)
+			}
+			if d.Len() > 0 {
+				fmt.Fprintf(&links, `<path d="%s" fill="none" stroke="%s" stroke-width="%.3f" stroke-linecap="round"/>`+"\n", d.String(), col, 2*spec.DotRadius)
+			}
+		}
+		if dots.Len() > 0 {
+			fmt.Fprintf(&b, `<g fill="%s">`+"\n%s</g>\n", col, dots.String())
+		}
+		b.WriteString(links.String())
 	}
 	b.WriteString("</svg>\n")
 	return b.String()

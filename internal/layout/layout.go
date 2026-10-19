@@ -1,6 +1,6 @@
 // Package layout is the single source of truth for what is drawn where.
-// Dark(x,y) answers "is this point ink?" for both the PNG rasterizer and tests;
-// the SVG writer emits the equivalent vector primitives.
+// Ink(x,y) answers "how much ink is at this point?" for both the PNG rasterizer
+// and tests; the SVG writer emits the equivalent vector primitives.
 package layout
 
 import (
@@ -14,8 +14,8 @@ import (
 type Style int
 
 const (
-	StyleDots Style = iota // every 1-cell is its own dot
-	StyleRuns              // consecutive 1-cells merge into one capsule-shaped stroke
+	StyleDots Style = iota // every inked cell is its own dot
+	StyleRuns              // neighbouring cells of the same level merge into capsule strokes
 )
 
 func ParseStyle(s string) (Style, error) {
@@ -30,118 +30,173 @@ func ParseStyle(s string) (Style, error) {
 
 type Layout struct {
 	V     spec.Version
+	G     *spec.Geometry
 	Cells *codec.Cells
 	Style Style
 }
 
-func New(v spec.Version, c *codec.Cells, s Style) *Layout { return &Layout{V: v, Cells: c, Style: s} }
+func New(v spec.Version, c *codec.Cells, s Style) *Layout {
+	return &Layout{V: v, G: v.Geo(), Cells: c, Style: s}
+}
 
-// Run is a circular run of consecutive set slots.
-type Run struct{ Start, Len int }
+// Level is the ink level (0 = background) of data cell i as a 0..1 darkness.
+func (l *Layout) Darkness(level uint8) float64 {
+	return float64(level) / float64(l.V.Levels()-1)
+}
 
-// Runs returns the circular runs of true bits. An all-true ring yields one run of Len==len(bits).
-func Runs(bits []bool) []Run {
-	n := len(bits)
-	z := -1
-	for i, b := range bits {
-		if !b {
-			z = i
-			break
+// Pair is two adjacent data cells of the same non-zero level (a "run" link).
+type Pair struct{ A, B int }
+
+// Pairs lists every link between neighbouring data cells of the same non-zero level.
+func (l *Layout) Pairs() []Pair {
+	var out []Pair
+	for i, c := range l.G.Cells {
+		if l.Cells.Data[i] == 0 {
+			continue
 		}
-	}
-	if z < 0 {
-		return []Run{{0, n}}
-	}
-	var out []Run
-	cur := Run{Start: -1}
-	for k := 1; k <= n; k++ {
-		i := (z + k) % n
-		if bits[i] {
-			if cur.Start < 0 {
-				cur = Run{Start: i}
+		for _, d := range spec.Neighbours[:3] { // half the directions: each pair once
+			j := l.G.CellAt(c.Q+d[0], c.R+d[1])
+			if j >= 0 && l.Cells.Data[j] == l.Cells.Data[i] {
+				out = append(out, Pair{i, j})
 			}
-			cur.Len++
-		} else if cur.Start >= 0 {
-			out = append(out, cur)
-			cur.Start = -1
-			cur.Len = 0
 		}
 	}
 	return out
 }
 
-// Dark reports whether point (x,y) in units (origin center, y down) is inked.
-func (l *Layout) Dark(x, y float64) bool {
-	r := math.Hypot(x, y)
-	v := l.V
-	if r > v.OuterRadius()+0.01 {
-		return false
-	}
-	if r < v.LogoR {
-		return false // clear logo zone; the logo itself is composited by the renderer
-	}
-	// finder bullseye (plain: disc + 2 rings; logo: 2 rings)
-	if r <= v.FinderOuter() {
-		for _, b := range v.FinderBands() {
-			if r >= b[0] && r <= b[1] {
-				return true
-			}
-		}
-		return false
-	}
-	// sync dot (top, outside the boundary ring)
-	if dy := y + v.SyncRadius(); x*x+dy*dy <= spec.SyncDotRadius*spec.SyncDotRadius {
-		return true
-	}
-	// boundary ring
-	if math.Abs(r-v.BoundaryRadius()) <= spec.BoundaryHalf {
-		return true
-	}
-	if r < v.HeaderRingRadius(0)-spec.DotRadius || r > v.DataRingRadius(v.Rings-1)+spec.DotRadius {
-		return false
-	}
-	theta := math.Atan2(x, -y)
-	if theta < 0 {
-		theta += 2 * math.Pi
-	}
-	runs := l.Style == StyleRuns
-	if r < v.DataRingRadius(0)-0.5 {
-		j := int(math.Floor(r - v.HeaderRingRadius(0) + 0.5))
-		if j >= 0 && j < spec.HeaderRings {
-			return cellDark(l.Cells.Header[j], v.HeaderRingRadius(j), r, theta, runs)
-		}
-		return false
-	}
-	k := int(math.Floor(r - v.DataRingRadius(0) + 0.5))
-	if k >= 0 && k < v.Rings {
-		return cellDark(l.Cells.Data[k], v.DataRingRadius(k), r, theta, runs)
-	}
-	return false
+// HeaderBit is the value of header slot t (copy t/32, bit t%32).
+func (l *Layout) HeaderBit(t int) bool {
+	return l.Cells.Header[t/spec.HeaderBits][t%spec.HeaderBits]
 }
 
-func cellDark(bits []bool, rc, r, theta float64, runs bool) bool {
-	w := spec.DotRadius
-	if math.Abs(r-rc) > w {
-		return false
+// HeaderRuns lists maximal circular runs of set header slots as (start, length);
+// an all-set ring is one run of HeaderSlots.
+func (l *Layout) HeaderRuns() []Pair {
+	n := spec.HeaderSlots
+	z := -1
+	for t := 0; t < n; t++ {
+		if !l.HeaderBit(t) {
+			z = t
+			break
+		}
 	}
-	n := len(bits)
-	t := theta * float64(n) / (2 * math.Pi)
-	i0 := int(math.Floor(t))
-	i0 = ((i0 % n) + n) % n
-	i1 := (i0 + 1) % n
-	if runs && bits[i0] && bits[i1] {
-		return true
+	if z < 0 {
+		return []Pair{{0, n}}
 	}
-	px, py := r*math.Sin(theta), -r*math.Cos(theta)
-	for _, idx := range [2]int{i0, i1} {
-		if !bits[idx] {
+	var out []Pair
+	cur := Pair{A: -1}
+	for k := 1; k <= n; k++ {
+		t := (z + k) % n
+		if l.HeaderBit(t) {
+			if cur.A < 0 {
+				cur = Pair{A: t}
+			}
+			cur.B++
+		} else if cur.A >= 0 {
+			out = append(out, cur)
+			cur = Pair{A: -1}
+		}
+	}
+	return out
+}
+
+func segDist2(px, py, ax, ay, bx, by float64) float64 {
+	dx, dy := bx-ax, by-ay
+	t := 0.0
+	if d2 := dx*dx + dy*dy; d2 > 0 {
+		t = math.Max(0, math.Min(1, ((px-ax)*dx+(py-ay)*dy)/d2))
+	}
+	ex, ey := px-(ax+t*dx), py-(ay+t*dy)
+	return ex*ex + ey*ey
+}
+
+// Ink returns the ink coverage (0 = background, 1 = full ink) at page point (x,y)
+// in units. The clear logo disc reports 0; the renderer composites the logo there.
+func (l *Layout) Ink(x, y float64) float64 {
+	g := l.G
+	if x*x+y*y <= g.LogoR*g.LogoR {
+		return 0
+	}
+	h := spec.HexNorm(x, y)
+	if h > g.ABorder+spec.BorderStroke/2+0.01 {
+		return 0
+	}
+	if math.Abs(h-g.ABorder) <= spec.BorderStroke/2 || math.Abs(h-g.AInner) <= spec.InnerStroke/2 {
+		return 1
+	}
+	switch {
+	case h < g.AInner:
+		return 0
+	case math.Abs(h-g.AHeader) <= spec.DotRadius+0.01:
+		return l.headerInk(x, y)
+	case h < g.AHeader-0.5:
+		return l.dataInk(x, y)
+	}
+	return 0
+}
+
+func (l *Layout) headerInk(x, y float64) float64 {
+	r2 := spec.DotRadius * spec.DotRadius
+	n := spec.HeaderSlots
+	for t := 0; t < n; t++ {
+		if !l.HeaderBit(t) {
 			continue
 		}
-		a := 2 * math.Pi * float64(idx) / float64(n)
-		dx, dy := px-rc*math.Sin(a), py+rc*math.Cos(a)
-		if dx*dx+dy*dy <= w*w {
-			return true
+		ax, ay := l.G.HeaderPos(t)
+		if (x-ax)*(x-ax)+(y-ay)*(y-ay) <= r2 {
+			return 1
+		}
+		if l.Style == StyleRuns {
+			u := (t + 1) % n
+			if l.HeaderBit(u) {
+				bx, by := l.G.HeaderPos(u)
+				if segDist2(x, y, ax, ay, bx, by) <= r2 {
+					return 1
+				}
+			}
 		}
 	}
-	return false
+	return 0
+}
+
+func (l *Layout) dataInk(x, y float64) float64 {
+	g := l.G
+	q0, r0 := g.NearestLattice(x, y)
+	r2 := spec.DotRadius * spec.DotRadius
+	best := 0.0
+	visit := func(q, r int) {
+		i := g.CellAt(q, r)
+		if i < 0 || l.Cells.Data[i] == 0 {
+			return
+		}
+		lv := l.Cells.Data[i]
+		t := l.Darkness(lv)
+		if t <= best {
+			return
+		}
+		ax, ay := g.LatticePos(q, r)
+		if (x-ax)*(x-ax)+(y-ay)*(y-ay) <= r2 {
+			best = t
+			return
+		}
+		if l.Style != StyleRuns {
+			return
+		}
+		for _, d := range spec.Neighbours[:3] {
+			j := g.CellAt(q+d[0], r+d[1])
+			if j < 0 || l.Cells.Data[j] != lv {
+				continue
+			}
+			bx, by := g.LatticePos(q+d[0], r+d[1])
+			if segDist2(x, y, ax, ay, bx, by) <= r2 {
+				best = t
+				return
+			}
+		}
+	}
+	visit(q0, r0)
+	for _, d := range spec.Neighbours {
+		visit(q0+d[0], r0+d[1])
+	}
+	return best
 }

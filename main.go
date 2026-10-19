@@ -1,5 +1,6 @@
-// roset encodes a SHA-256 digest as a concentric ring-and-dot symbol and
-// decodes it back from an image (scan, screenshot or photo).
+// roset encodes a SHA-256 digest as a honeycomb symbol (a flower of seven
+// hexagonal patches, logo in the middle) and decodes it back from an image
+// (scan, screenshot or photo).
 package main
 
 import (
@@ -28,7 +29,7 @@ import (
 	"roset/internal/spec"
 )
 
-const usage = `roset - encode a SHA-256 as a ring-and-dot code, and read it back from images
+const usage = `roset - encode a SHA-256 as a hexagonal honeycomb code, and read it back from images
 
 Usage:
   roset encode [flags] <sha256-hex | ->      encode a digest (- reads hex from stdin)
@@ -38,13 +39,16 @@ Usage:
 encode flags:
   -o <file>        output (.svg or .png); default: SVG on stdout
   --size <px>      PNG size in pixels (default 1024)
-  --style <s>      dots | runs  (runs merges adjacent dots into single strokes; default runs)
+  --style <s>      dots | runs  (runs merges neighbouring cells of the same level into strokes; default runs)
+  --levels <n>     auto | 2 | 4  ink levels per cell: 2 = on/off (most robust), 4 = four grays
+                   (twice the bits per cell). auto (default) uses 2 unless the payload needs 4
   --fg <color>     ink colour as #rrggbb (default #16161c)
   --bg <color>     background colour as #rrggbb (default #faf8f0)
   --tag <text>     attach up to 48 bytes of extra data (mode 1, larger symbol)
   --file <path>    hash this file with SHA-256 instead of taking hex
-  --logo <file>    put a logo in the centre (SVG, PNG, JPEG or GIF)
-  --logo-size <s>  small | medium | large clear zone (default medium: ~20% of the width)
+  --logo <file>    put a logo in the centre hexagon (SVG, PNG, JPEG or GIF)
+  --logo-size <s>  small | medium | large | xlarge centre/petal size (default medium; the logo
+                   disc is ~13%, 16%, 18%, 19% of the symbol width). Bigger = more cells
   --logo-fit <f>   auto (fit the logo's visible ink, default) | viewbox (fit the whole image)
   --logo-scale <x> multiply the logo's automatic size (default 1)
   --logo-bg <c>    backdrop colour behind the logo as #rrggbb (default: --bg)
@@ -107,6 +111,7 @@ func runEncode(args []string) int {
 	file := fs.String("file", "", "")
 	logoPath := fs.String("logo", "", "")
 	logoSize := fs.String("logo-size", "medium", "")
+	levelsS := fs.String("levels", "auto", "")
 	logoFit := fs.String("logo-fit", "auto", "")
 	logoScale := fs.Float64("logo-scale", 1, "")
 	logoBGS := fs.String("logo-bg", "", "")
@@ -164,13 +169,22 @@ func runEncode(args []string) int {
 	var lg *logo.Logo
 	var logoBG *color.NRGBA
 	logoBGCSS := ""
-	zoneR := 0.0
+	k, ok := spec.LogoSizes[*logoSize]
+	if !ok {
+		return fail(2, "--logo-size must be small, medium, large or xlarge")
+	}
+	var bitsTry []int
+	switch *levelsS {
+	case "auto":
+		bitsTry = []int{1, 2}
+	case "2":
+		bitsTry = []int{1}
+	case "4":
+		bitsTry = []int{2}
+	default:
+		return fail(2, "--levels must be auto, 2 or 4")
+	}
 	if *logoPath != "" {
-		r, ok := spec.LogoSizes[*logoSize]
-		if !ok {
-			return fail(2, "--logo-size must be small, medium or large")
-		}
-		zoneR = r
 		fit := logo.FitAuto
 		switch *logoFit {
 		case "auto":
@@ -190,7 +204,12 @@ func runEncode(args []string) int {
 			logoBG, logoBGCSS = &c, css
 		}
 	}
-	ver, err := codec.PickVersion(len(payload), zoneR)
+	var ver spec.Version
+	for _, bits := range bitsTry {
+		if ver, err = codec.PickVersion(len(payload), k, bits); err == nil {
+			break
+		}
+	}
 	if err != nil {
 		return fail(2, "%v", err)
 	}
@@ -229,7 +248,7 @@ func runEncode(args []string) int {
 	default:
 		return fail(2, "unsupported output extension %q (use .svg or .png)", ext)
 	}
-	fmt.Fprintf(os.Stderr, "roset: encoded %d payload bytes as version %d (mode %d, %d rings)\n", len(payload), ver.ID, mode, ver.Rings)
+	fmt.Fprintf(os.Stderr, "roset: encoded %d payload bytes as version %d (mode %d, patch radius %d, %d levels per cell, RS(%d,%d))\n", len(payload), ver.ID, mode, ver.K, ver.Levels(), ver.N, ver.Payload)
 	return 0
 }
 
@@ -291,7 +310,7 @@ func runDecode(args []string) int {
 	if *verbose {
 		fmt.Fprintf(os.Stderr, "roset: %s image, version %d, mode %d, %d byte(s) repaired by Reed-Solomon\n", format, res.Version, res.Mode, res.Corrected)
 		fmt.Fprintf(os.Stderr, "roset: %.1f px/unit, %s frame, %s threshold, inverted=%v, mirrored=%v, %d attempt(s)\n",
-			rep.Unit, rep.FrameKind, rep.Binarizer, rep.Inverted, rep.Dir < 0, rep.Attempts)
+			rep.Unit, rep.FrameKind, rep.Binarizer, rep.Inverted, rep.Mirrored, rep.Attempts)
 	}
 	hash, tag := res.Hash()
 	if res.Mode > codec.ModeSHA256Tag || hash == nil {
